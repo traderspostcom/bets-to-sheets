@@ -200,5 +200,27 @@ app.post("/ingest", async (req, res) => {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
+// 🔹 Simple test endpoint to fetch odds directly
+app.get("/odds", async (req, res) => {
+  try {
+    const { sportKey, market, team, side, spreadPoint, totalPoint, books } = req.query;
+
+    const booksArr = books ? books.split(",").map(s => s.trim()) : ["fanduel", "draftkings", "betmgm"];
+
+    const result = await fetchOddsAndNormalize({
+      sportKey,
+      market,
+      team,
+      side,
+      spreadPoint,
+      totalPoint,
+      books: booksArr,
+    });
+
+    res.json({ ok: true, result });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
 
 app.listen(PORT, () => console.log(`Listening on :${PORT}`));

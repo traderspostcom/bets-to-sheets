@@ -1,0 +1,204 @@
+import express from "express";
+import { google } from "googleapis";
+import { fetchOddsAndNormalize } from "./odds.js";
+
+const app = express();
+app.use(express.json({ limit: "5mb" }));
+
+const PORT = process.env.PORT || 3000;
+const SHARED_TOKEN = process.env.SHARED_TOKEN;
+const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
+const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
+const GOOGLE_PRIVATE_KEY = (process.env.GOOGLE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
+
+if (!SHARED_TOKEN || !SPREADSHEET_ID || !GOOGLE_CLIENT_EMAIL || !GOOGLE_PRIVATE_KEY) {
+  console.error("Missing env vars.");
+  process.exit(1);
+}
+
+const auth = new google.auth.JWT(
+  GOOGLE_CLIENT_EMAIL,
+  null,
+  GOOGLE_PRIVATE_KEY,
+  ["https://www.googleapis.com/auth/spreadsheets"]
+);
+const sheets = google.sheets({ version: "v4", auth });
+
+function fromAmerican(am) {
+  const n = Number(am);
+  if (!Number.isFinite(n) || n === 0) return { decimal: null, implied: null };
+  const dec = n > 0 ? (1 + n/100) : (1 + 100/Math.abs(n));
+  const imp = n > 0 ? (100/(n+100)) : (Math.abs(n)/(Math.abs(n)+100));
+  return { decimal: dec, implied: imp };
+}
+function parseFairProb(row) {
+  const fairPctRaw = row["Fair %"] ?? row["Fair%"] ?? row["FairPct"];
+  if (fairPctRaw !== undefined && String(fairPctRaw).trim() !== "") {
+    const num = Number(String(fairPctRaw).replace("%","").trim());
+    if (Number.isFinite(num)) return Math.min(Math.max(num/100, 0), 1);
+  }
+  const fairLineRaw = row["Fair Line"] ?? row["Fair (Am)"] ?? row["Fair Odds"];
+  if (fairLineRaw !== undefined && String(fairLineRaw).trim() !== "") {
+    const { implied } = fromAmerican(fairLineRaw);
+    if (implied !== null) return Math.min(Math.max(implied, 0), 1);
+  }
+  return null;
+}
+function normalizeMarketName(m) {
+  const s = String(m || "").toLowerCase();
+  if (["ml","moneyline","h2h"].includes(s)) return "h2h";
+  if (["spread","spreads","ats"].includes(s)) return "spreads";
+  if (["total","totals","o/u","ou"].includes(s)) return "totals";
+  return s || "h2h";
+}
+function parsePoint(val) {
+  if (val === undefined || val === null) return null;
+  const n = Number(String(val).replace(/[^\d\.\-]/g,""));
+  return Number.isFinite(n) ? n : null;
+}
+function nowET() {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hour12: false
+  });
+  const parts = Object.fromEntries(fmt.formatToParts(new Date()).map(p => [p.type, p.value]));
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
+}
+async function ensureSheetAndHeaders(spreadsheetId, sheetName, requiredHeaders) {
+  const meta = await sheets.spreadsheets.get({ spreadsheetId });
+  const found = meta.data.sheets?.find(s => s.properties.title === sheetName);
+  if (!found) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: { requests: [{ addSheet: { properties: { title: sheetName } } }] },
+    });
+  }
+  const res = await sheets.spreadsheets.values.get({ spreadsheetId, range: `${sheetName}!1:1` }).catch(() => null);
+  let headers = res?.data?.values?.[0]?.map(String) || [];
+  if (headers.length === 0) {
+    headers = requiredHeaders.slice();
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: `${sheetName}!1:1`,
+      valueInputOption: "RAW",
+      requestBody: { values: [headers] },
+    });
+  } else {
+    const missing = requiredHeaders.filter(h => !headers.includes(h));
+    if (missing.length) {
+      headers = headers.concat(missing);
+      await sheets.spreadsheets.values.update({
+        spreadsheetId,
+        range: `${sheetName}!1:1`,
+        valueInputOption: "RAW",
+        requestBody: { values: [headers] },
+      });
+    }
+  }
+  return headers;
+}
+
+app.get("/", (req, res) => res.json({ ok: true, service: "bets-to-sheets" }));
+
+app.post("/ingest", async (req, res) => {
+  try {
+    const token = req.get("X-Auth");
+    if (token !== SHARED_TOKEN) return res.status(401).json({ ok: false, error: "Unauthorized" });
+
+    const { mode, rows, enrichWithOdds } = req.body || {};
+    if (!["track","buy"].includes(mode)) return res.status(400).json({ ok: false, error: "mode must be 'track' or 'buy'" });
+    if (!Array.isArray(rows) || rows.length === 0) return res.status(400).json({ ok: false, error: "rows[] required" });
+
+    const schema = {
+      track: [
+        "Date (ET)","Sport","Market","Side","Book","Odds (Am)","Decimal","Implied %","Fair %","Model %",
+        "Blend %","Edge %","EV per $1","Kelly %","Kelly (25%)","Confidence","Rationale","Entry Timing","Risk Flags",
+        "Play-to (Am)","Fetched (ET)","CLV %","Result"
+      ],
+      buy: ["Date","bankroll","Pick","Line","Bet Amount"]
+    }[mode];
+
+    const sheetName = mode === "track" ? "Track" : "Buy";
+    const headers = await ensureSheetAndHeaders(SPREADSHEET_ID, sheetName, schema);
+
+    const outRows = [];
+    for (const r of rows) {
+      let newRow = { ...r };
+
+      const marketInput = newRow.market || newRow.Market;
+      const market = normalizeMarketName(marketInput);
+      newRow.Market = newRow.Market || (marketInput || (market === "h2h" ? "Moneyline" : market));
+
+      const point = parsePoint(newRow.Point);
+      const spreadPoint = newRow.spreadPoint != null ? Number(newRow.spreadPoint) : (market === "spreads" ? point : null);
+      const totalPoint  = newRow.totalPoint  != null ? Number(newRow.totalPoint)  : (market === "totals"  ? point : null);
+      const side = newRow.Side;
+
+      const provided = newRow["Odds (Am)"] ?? newRow.Line;
+      const sportKey = newRow.sportKey;
+      const team     = newRow.team || newRow.Side;
+      const books    = Array.isArray(newRow.books)
+        ? newRow.books
+        : (typeof newRow.books === "string" ? newRow.books.split(",").map(s => s.trim()).filter(Boolean) : []);
+
+      if (enrichWithOdds) {
+        try {
+          const oddsInfo = await fetchOddsAndNormalize({
+            line: provided, sportKey, market, team, side, spreadPoint, totalPoint, books
+          });
+          newRow = { ...newRow, ...oddsInfo };
+          if (oddsInfo["Book"]) newRow["Book"] = oddsInfo["Book"];
+          if (oddsInfo["Point"] != null && newRow["Point"] == null) newRow["Point"] = oddsInfo["Point"];
+        } catch {
+          if (provided) newRow["Odds (Am)"] = String(provided);
+        }
+      } else {
+        if (provided) newRow["Odds (Am)"] = String(provided);
+      }
+
+      if (newRow["Odds (Am)"] && (!newRow["Decimal"] || !newRow["Implied %"])) {
+        const { decimal, implied } = fromAmerican(newRow["Odds (Am)"]);
+        if (decimal !== null) newRow["Decimal"] = Number(decimal.toFixed(4));
+        if (implied !== null) newRow["Implied %"] = Number((implied*100).toFixed(2)) + "%";
+      }
+
+      const pFair = parseFairProb(newRow);
+      const am = newRow["Odds (Am)"];
+      const dInfo = fromAmerican(am);
+      const d = dInfo.decimal;
+      const pImp = dInfo.implied;
+
+      if (pFair !== null && d !== null && pImp !== null) {
+        const edgePct = (pFair - pImp) * 100;
+        const evPer1 = pFair * (d - 1) - (1 - pFair) * 1;
+        let kelly = ((d * pFair) - (1 - pFair)) / (d - 1);
+        if (!Number.isFinite(kelly) || kelly < 0) kelly = 0;
+        if (kelly > 1) kelly = 1;
+
+        newRow["Edge %"]      = Number(edgePct.toFixed(2)) + "%";
+        newRow["EV per $1"]   = Number(evPer1.toFixed(3));
+        newRow["Kelly %"]     = Number((kelly * 100).toFixed(2)) + "%";
+        newRow["Kelly (25%)"] = Number((kelly * 25).toFixed(2)) + "%";
+      }
+
+      newRow["Fetched (ET)"] = nowET();
+
+      outRows.push(newRow);
+    }
+
+    const rowValues = outRows.map(r => headers.map(h => r[h] ?? ""));
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${sheetName}!A:A`,
+      valueInputOption: "USER_ENTERED",
+      requestBody: { values: rowValues },
+    });
+
+    res.json({ ok: true, sheetName, inserted: rowValues.length });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+app.listen(PORT, () => console.log(`Listening on :${PORT}`));

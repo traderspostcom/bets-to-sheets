@@ -1,1 +1,14 @@
-
+{
+  "name": "bets-to-sheets",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "googleapis": "^131.0.0",
+    "node-fetch": "^3.3.2"
+  }
+}

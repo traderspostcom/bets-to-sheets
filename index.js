@@ -1,34 +1,17 @@
 import express from "express";
-import { google } from "googleapis";
 import { fetchOddsAndNormalize } from "./odds.js";
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
 const PORT = process.env.PORT || 3000;
-const SHARED_TOKEN = process.env.SHARED_TOKEN;
-const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
-const GOOGLE_PRIVATE_KEY = (process.env.GOOGLE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
 
-if (!SHARED_TOKEN || !SPREADSHEET_ID || !GOOGLE_CLIENT_EMAIL || !GOOGLE_PRIVATE_KEY) {
-  console.error("Missing env vars.");
-  process.exit(1);
-}
+/** Root health check */
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "odds-backend is live" });
+});
 
-// Google Sheets auth
-const auth = new google.auth.JWT(
-  GOOGLE_CLIENT_EMAIL,
-  null,
-  GOOGLE_PRIVATE_KEY,
-  ["https://www.googleapis.com/auth/spreadsheets"]
-);
-const sheets = google.sheets({ version: "v4", auth });
-
-/** Root check */
-app.get("/", (req, res) => res.json({ ok: true, service: "bets-to-sheets" }));
-
-/** ✅ NEW: Odds lookup route */
+/** Odds lookup route */
 app.get("/odds", async (req, res) => {
   try {
     const { sportKey, market, team, side, spreadPoint, totalPoint, books, line } = req.query;
@@ -55,12 +38,6 @@ app.get("/odds", async (req, res) => {
   }
 });
 
-/** Existing ingest route (unchanged, trimmed here for brevity) */
-app.post("/ingest", async (req, res) => {
-  // ... your ingest logic ...
-  res.json({ ok: true });
-});
-
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`✅ Server running on port ${PORT}`);
 });
